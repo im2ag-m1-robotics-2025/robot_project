@@ -16,24 +16,27 @@ import threading
 class Create3Controller(Node):
     def __init__(self):
         super().__init__("create3_controller")
+
+        self.declare_parameter("topicPrefix","")
+        self.topic_prefix = self.get_parameter("topicPrefix").value
         
         # Create callback groups
         self.hazard_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = MutuallyExclusiveCallbackGroup()
         
         self.cmd_vel_publisher = self.create_publisher(
-            Twist, "/cmd_vel", QoSProfile(depth=10)
+            Twist, self.topic_prefix+"/cmd_vel", QoSProfile(depth=10)
         )
         self.undock_client = ActionClient(
             self, 
             Undock, 
-            "/undock", 
+            self.topic_prefix+"/undock", 
             callback_group=self.action_callback_group
         )
         self.dock_client = ActionClient(
             self, 
             Dock, 
-            "/dock", 
+            self.topic_prefix+"/dock", 
             callback_group=self.action_callback_group
         )
         
@@ -46,7 +49,7 @@ class Create3Controller(Node):
         
         self.hazard_subscription = self.create_subscription(
             HazardDetectionVector,
-            '/hazard_detection',
+            self.topic_prefix+'/hazard_detection',
             self.hazard_callback,
             hazard_qos,
             callback_group=self.hazard_callback_group
