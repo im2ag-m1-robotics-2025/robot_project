@@ -8,6 +8,8 @@ from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import HazardDetectionVector, HazardDetection
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from irobot_create_msgs.action import RotateAngle
+from irobot_create_msgs.msg import DockStatus
 import time
 import math
 import threading
@@ -23,6 +25,7 @@ class Create3Controller(Node):
         # Create callback groups
         self.hazard_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = MutuallyExclusiveCallbackGroup()
+        self.dock_looker_callback_group = ReentrantCallbackGroup()
         
         self.cmd_vel_publisher = self.create_publisher(
             Twist, self.topic_prefix+"/cmd_vel", QoSProfile(depth=10)
@@ -37,6 +40,13 @@ class Create3Controller(Node):
             self, 
             Dock, 
             self.topic_prefix+"/dock", 
+            callback_group=self.action_callback_group
+        )
+
+        self.rotate_client = ActionClient(
+            self,
+            RotateAngle,
+            self.topic_prefix+"/rotate_angle",
             callback_group=self.action_callback_group
         )
         
@@ -54,9 +64,27 @@ class Create3Controller(Node):
             hazard_qos,
             callback_group=self.hazard_callback_group
         )
+
+        dock_looker_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        self.dock_looker_subscription = self.create_subscription(
+            DockStatus,
+            self.topic_prefix+"/dock_status",
+            self.dock_status_callback,
+            dock_looker_qos,
+            callback_group=self.dock_looker_callback_group
+        )
+
         self.bump_detected = False
         self.front_center_bump = False
         self._stop_requested = False
+        self.sees_dock = False
+        self.docked = False
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
     def hazard_callback(self, msg):
@@ -70,6 +98,10 @@ class Create3Controller(Node):
                     self.get_logger().info(f"Front center bump detected! Frame: {detection.header.frame_id}")
                 else:
                     self.get_logger().info(f"Bump detected in: {detection.header.frame_id}")
+
+    def dock_status_callback(self,msg: DockStatus):
+        self.sees_dock = msg.dock_visible
+        self.docked = msg.is_docked
     
     def undock(self):
         self.get_logger().info("Undocking...")
@@ -196,16 +228,24 @@ class Create3Controller(Node):
         self.get_logger().info("Stopped after bump or timeout")
 
     def rotate(self, angle, angular_speed=0.5):
-        self.get_logger().info(f"Rotating {angle} radians...")
-        twist = Twist()
-        twist.angular.z = angular_speed if angle > 0 else -angular_speed
-        duration = abs(angle) / angular_speed
-        start_time = self.get_clock().now().seconds_nanoseconds()[0]
-        while self.get_clock().now().seconds_nanoseconds()[0] - start_time < duration:
-            self.cmd_vel_publisher.publish(twist)
-            time.sleep(0.1)
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
+        if not self.rotate_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("RotateAngle action server not available!")
+            return
+
+        goal_msg = RotateAngle.Goal()
+        goal_msg.angle = angle
+        future = self.rotate_client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, future)
+        time.sleep(1.0)
+    
+    def move_to_dock(self):
+        if self.docked:
+            return
+        if not self.sees_dock:
+            self.move_forward(1.0)
+        else:
+            self.cmd_vel_publisher.publish(Twist())
+            self.dock()
 
 
 def main(args=None):
@@ -242,8 +282,8 @@ def main(args=None):
             
             # Complete the sequence
             node.rotate(math.pi)
-            node.move_forward(1.0)
-            node.dock()
+            timer = node.create_timer(0.05,node.move_to_dock)
+            rclpy.spin(node)
         else:
             node.get_logger().error("Failed to undock, aborting sequence")
     except Exception as e:
