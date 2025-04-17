@@ -11,6 +11,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 import time
 import math
 import threading
+from nav_msgs.msg import Odometry
 
 
 class Create3Controller(Node):
@@ -54,9 +55,15 @@ class Create3Controller(Node):
             hazard_qos,
             callback_group=self.hazard_callback_group
         )
+        self.current_yaw = 0.0
+        self.odom_subscription = self.create_subscription(
+            Odometry,
+            self.topic_prefix + '/odom',
+            self.odom_callback,
+            QoSProfile(depth=10),
+            callback_group=self.hazard_callback_group
+        )
         self.bump_detected = False
-        self.front_center_bump = False
-        self._stop_requested = False
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
     def hazard_callback(self, msg):
@@ -132,80 +139,70 @@ class Create3Controller(Node):
         self.cmd_vel_publisher.publish(twist)
 
     def move_until_bump(self, speed=0.2, timeout=30.0):
-        """Move forward until a bump is detected or timeout is reached"""
-        self.get_logger().info("Moving forward until bump detected...")
+        self.get_logger().info("Moving forward until any bump detected...")
         self.bump_detected = False
-        self.front_center_bump = False
-        self._stop_requested = False
-        
-        # Debug: List available topics to verify the hazard topic
-        topic_names_and_types = self.get_topic_names_and_types()
-        hazard_topics = [name for name, types in topic_names_and_types if 'hazard' in name.lower()]
-        self.get_logger().info(f"Available hazard topics: {hazard_topics}")
-        
-        # Create and start publisher thread
-        def publish_velocity():
-            twist = Twist()
-            twist.linear.x = speed
-            
-            # Use a simple sleep-based approach instead of rate
-            while not (self.front_center_bump or self._stop_requested):
-                self.cmd_vel_publisher.publish(twist)
-                self.get_logger().debug(f"Publishing velocity command: {twist.linear.x}")
-                # Allow time for executor to process callbacks
-                time.sleep(0.05)
-            
-            # Stop moving
-            twist.linear.x = 0.0
+
+        twist = Twist()
+        twist.linear.x = speed
+
+        start = self.get_clock().now().nanoseconds / 1e9
+        last_log = start
+
+        while not self.bump_detected:
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - start > timeout:
+                self.get_logger().info("Timeout reached without bump")
+                break
+
             self.cmd_vel_publisher.publish(twist)
-            self.get_logger().info("Velocity publisher thread stopped")
-        
-        publisher_thread = threading.Thread(target=publish_velocity)
-        publisher_thread.daemon = True  # Make thread daemon so it exits when main thread exits
-        publisher_thread.start()
-        
-        # Monitor for timeout or bump in main thread
-        start_time = self.get_clock().now().seconds_nanoseconds()[0]
-        last_log_time = start_time
-        
-        try:
-            while not self.front_center_bump:
-                current_time = self.get_clock().now().seconds_nanoseconds()[0]
-                
-                # Log status periodically
-                if current_time - last_log_time > 2.0:
-                    self.get_logger().info(f"Still moving... bump_detected={self.bump_detected}, front_center_bump={self.front_center_bump}")
-                    last_log_time = current_time
-                
-                if current_time - start_time > timeout:
-                    self.get_logger().info("Timeout reached without front center bump")
-                    break
-                    
-                # Allow time for processing callbacks
-                time.sleep(0.1)
-        finally:
-            # Request thread to stop and wait for it
-            self._stop_requested = True
-            publisher_thread.join(timeout=2.0)  # Add timeout to avoid hanging
-            
-            # Make sure robot stops
-            stop_cmd = Twist()
-            self.cmd_vel_publisher.publish(stop_cmd)
-            self.cmd_vel_publisher.publish(stop_cmd)  # Send twice to ensure it's received
-            
+            # let any incoming hazard_callback run
+            rclpy.spin_once(self, timeout_sec=0)
+
+            # periodic status
+            if now - last_log > 2.0:
+                self.get_logger().info(f"Still moving… bump_detected={self.bump_detected}")
+                last_log = now
+
+            time.sleep(0.05)
+
+        # stop motion
+        twist.linear.x = 0.0
+        self.cmd_vel_publisher.publish(twist)
         self.get_logger().info("Stopped after bump or timeout")
 
+    def odom_callback(self, msg):
+        # extract yaw from quaternion
+        q = msg.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny, cosy)
+
+    def _angle_diff(self, target, current):
+        # shortest angular difference
+        a = (target - current + math.pi) % (2*math.pi) - math.pi
+        return a
+
     def rotate(self, angle, angular_speed=0.5):
-        self.get_logger().info(f"Rotating {angle} radians...")
+        self.get_logger().info(f"Rotating {angle} radians (feedback)...")
+        # accumulate actual yaw change
+        prev_yaw = self.current_yaw
+        turned = 0.0
         twist = Twist()
         twist.angular.z = angular_speed if angle > 0 else -angular_speed
-        duration = abs(angle) / angular_speed
-        start_time = self.get_clock().now().seconds_nanoseconds()[0]
-        while self.get_clock().now().seconds_nanoseconds()[0] - start_time < duration:
+
+        while abs(turned) < abs(angle):
             self.cmd_vel_publisher.publish(twist)
-            time.sleep(0.1)
+            rclpy.spin_once(self, timeout_sec=0)
+            # compute incremental yaw (handles wrapping)
+            delta = self._angle_diff(self.current_yaw, prev_yaw)
+            turned += delta
+            prev_yaw = self.current_yaw
+            time.sleep(0.02)
+
+        # stop rotation
         twist.angular.z = 0.0
         self.cmd_vel_publisher.publish(twist)
+        self.get_logger().info("Rotation complete")
 
 
 def main(args=None):
