@@ -66,7 +66,7 @@ class Create3Controller(Node):
         self.current_yaw = 0.0
         self.current_x = 0.0
         self.current_y = 0.0
-        self.path = []
+        self.last_bump_side = 'front'
         self.odom_subscription = self.create_subscription(
             Odometry,
             self.topic_prefix + '/odom',
@@ -78,9 +78,13 @@ class Create3Controller(Node):
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
     def hazard_callback(self, msg):
-        self.get_logger().info(f"Received hazard detection with {len(msg.detections)} detections")
         for detection in msg.detections:
             if detection.type == HazardDetection.BUMP:
+                # detect which side bumped
+                fid = detection.header.frame_id.lower()
+                if 'left' in fid: self.last_bump_side = 'left'
+                elif 'right' in fid: self.last_bump_side = 'right'
+                else: self.last_bump_side = 'front'
                 self.bump_detected = True
                 # Check if the bump is in the front center
                 if "front_center" in detection.header.frame_id:
@@ -215,32 +219,54 @@ class Create3Controller(Node):
         rclpy.spin_until_future_complete(self, future)
         time.sleep(1.0)
 
+    def return_to_dock(self, speed=0.2, backup_dist=0.1):
+        self.get_logger().info("Returning to dock")
+        while True:
+            dx = -self.current_x; dy = -self.current_y
+            dist = math.hypot(dx, dy)
+            if dist <= 0.5:
+                # face dock before final adjustment
+                target_yaw = math.atan2(dy, dx)
+                self.rotate(self._angle_diff(target_yaw, self.current_yaw))
+                # final move to exactly 0.5 m away
+                delta = dist - 0.5
+                if abs(delta) > 0.01:
+                    self.move_forward(delta)
+                break
+
+            # face dock
+            target_yaw = math.atan2(dy, dx)
+            self.rotate(self._angle_diff(target_yaw, self.current_yaw))
+
+            # move toward dock, avoid obstacles
+            self.move_until_bump(speed=speed, timeout=dist/speed + 1, backup_dist=backup_dist)
+            if self.bump_detected:
+                # pick turn direction
+                if self.last_bump_side == 'left':
+                    turn = -math.pi/2
+                else:
+                    turn = math.pi/2
+                self.rotate(turn)
+
+        self.get_logger().info("Positioned for docking")
+        self.dock()
+
     def discover_room(self, duration, speed=0.2):
-        """Undock, explore for duration, record path, then return and re-undock."""
         if not self.undock():
             self.get_logger().error("Undock failed, aborting discovery")
             return
         self.get_logger().info(f"Starting discovery for {duration}s")
-        self.path = []
         start_t = self.get_clock().now().nanoseconds / 1e9
         while self.get_clock().now().nanoseconds / 1e9 - start_t < duration:
-            # explore until bump, get forward travel length
-            dist = self.move_until_bump(speed=speed, timeout=duration)
-            self.path.append({'type':'move', 'distance':dist})
-            # turn left 90°
-            angle = math.pi/2
-            self.rotate(angle)
-            self.path.append({'type':'rotate', 'angle':angle})
-        self.get_logger().info("Time up, returning to dock")
-        # undo path in reverse
-        for act in reversed(self.path):
-            if act['type'] == 'rotate':
-                self.rotate(-act['angle'])
-            else:  # move: go backward along recorded segment
-                self.move_forward(-act['distance'], speed=speed)
-        self.dock()
-        time.sleep(1.0)
-        self.undock()
+            self.move_until_bump(speed=speed, timeout=duration, backup_dist=0.1)
+            # turn based on last bump side
+            if self.last_bump_side == 'left':
+                self.rotate(-math.pi/2)
+            else:
+                # front or right => left
+                self.rotate(math.pi/2)
+        # time up: navigate back to dock
+        self.return_to_dock(speed=speed, backup_dist=0.1)
         self.get_logger().info("Discovery complete")
 
 def main(args=None):
