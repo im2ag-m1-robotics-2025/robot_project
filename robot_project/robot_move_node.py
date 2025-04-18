@@ -149,37 +149,44 @@ class Create3Controller(Node):
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
 
-    def move_until_bump(self, speed=0.2, timeout=30.0):
-        self.get_logger().info("Moving forward until any bump detected...")
+    def move_until_bump(self, speed=0.2, timeout=30.0, backup_dist=0.1):
+        # record start pose
+        x_start, y_start = self.current_x, self.current_y
         self.bump_detected = False
 
         twist = Twist()
         twist.linear.x = speed
-
         start = self.get_clock().now().nanoseconds / 1e9
-        last_log = start
 
+        # move forward until bump or timeout
         while not self.bump_detected:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - start > timeout:
-                self.get_logger().info("Timeout reached without bump")
                 break
-
             self.cmd_vel_publisher.publish(twist)
-            # let any incoming hazard_callback run
             rclpy.spin_once(self, timeout_sec=0)
-
-            # periodic status
-            if now - last_log > 2.0:
-                self.get_logger().info(f"Still moving… bump_detected={self.bump_detected}")
-                last_log = now
-
             time.sleep(0.05)
 
-        # stop motion
+        # stop forward motion
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info("Stopped after bump or timeout")
+
+        # compute forward distance travelled
+        fwd_dist = math.hypot(self.current_x - x_start, self.current_y - y_start)
+
+        # back up a bit to clear obstacle
+        if self.bump_detected:
+            twist.linear.x = -speed
+            dur = backup_dist / speed
+            t0 = self.get_clock().now().nanoseconds / 1e9
+            while self.get_clock().now().nanoseconds / 1e9 - t0 < dur:
+                self.cmd_vel_publisher.publish(twist)
+                rclpy.spin_once(self, timeout_sec=0)
+                time.sleep(0.05)
+            twist.linear.x = 0.0
+            self.cmd_vel_publisher.publish(twist)
+
+        return fwd_dist
 
     def odom_callback(self, msg):
         # extract yaw from quaternion
@@ -215,12 +222,8 @@ class Create3Controller(Node):
         self.path = []
         start_t = self.get_clock().now().nanoseconds / 1e9
         while self.get_clock().now().nanoseconds / 1e9 - start_t < duration:
-            # move until bump
-            self.bump_detected = False
-            x0, y0 = self.current_x, self.current_y
-            self.move_until_bump(speed=speed, timeout=duration)
-            # record move distance
-            dist = math.hypot(self.current_x - x0, self.current_y - y0)
+            # explore until bump, get forward travel length
+            dist = self.move_until_bump(speed=speed, timeout=duration)
             self.path.append({'type':'move', 'distance':dist})
             # turn left 90°
             angle = math.pi/2
@@ -255,7 +258,7 @@ def main(args=None):
     time.sleep(2.0)  # Wait for subscriptions to be established
 
     try:
-        node.discover_room(duration=30.0)
+        node.discover_room(duration=15.0)
     except Exception as e:
         node.get_logger().error(f"An error occurred: {e}")
         import traceback
