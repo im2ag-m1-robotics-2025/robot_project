@@ -64,6 +64,9 @@ class Create3Controller(Node):
             callback_group=self.hazard_callback_group
         )
         self.current_yaw = 0.0
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.path = []
         self.odom_subscription = self.create_subscription(
             Odometry,
             self.topic_prefix + '/odom',
@@ -184,6 +187,8 @@ class Create3Controller(Node):
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny, cosy)
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
 
     def _angle_diff(self, target, current):
         # shortest angular difference
@@ -201,29 +206,39 @@ class Create3Controller(Node):
         rclpy.spin_until_future_complete(self, future)
         time.sleep(1.0)
 
-'''
-    def rotate(self, angle, angular_speed=0.5):
-        #self.get_logger().info(f"Rotating {angle} radians (feedback)...")
-        # accumulate actual yaw change
-        #prev_yaw = self.current_yaw
-        #turned = 0.0
-        #twist = Twist()
-        #twist.angular.z = angular_speed if angle > 0 else -angular_speed
-
-        #while abs(turned) < abs(angle):
-        #    self.cmd_vel_publisher.publish(twist)
-        #    rclpy.spin_once(self, timeout_sec=0)
-        #    # compute incremental yaw (handles wrapping)
-        ###    delta = self._angle_diff(self.current_yaw, prev_yaw)
-            turned += delta
-            prev_yaw = self.current_yaw
-            time.sleep(0.02)
-
-        # stop rotation
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info("Rotation complete")'''
-        
+    def discover_room(self, duration, speed=0.2):
+        """Undock, explore for duration, record path, then return and re-undock."""
+        if not self.undock():
+            self.get_logger().error("Undock failed, aborting discovery")
+            return
+        self.get_logger().info(f"Starting discovery for {duration}s")
+        self.path = []
+        start_t = self.get_clock().now().nanoseconds / 1e9
+        while self.get_clock().now().nanoseconds / 1e9 - start_t < duration:
+            # move until bump
+            self.bump_detected = False
+            x0, y0 = self.current_x, self.current_y
+            self.move_until_bump(speed=speed, timeout=duration)
+            # record move distance
+            dist = math.hypot(self.current_x - x0, self.current_y - y0)
+            self.path.append({'type':'move', 'distance':dist})
+            # turn left 90°
+            angle = math.pi/2
+            self.rotate(angle)
+            self.path.append({'type':'rotate', 'angle':angle})
+        self.get_logger().info("Time up, returning to dock")
+        # undo path in reverse
+        for act in reversed(self.path):
+            if act['type']=='rotate':
+                self.rotate(-act['angle'])
+            else:  # move
+                self.rotate(math.pi)
+                self.move_forward(act['distance'])
+                self.rotate(math.pi)
+        self.dock()
+        time.sleep(1.0)
+        self.undock()
+        self.get_logger().info("Discovery complete")
 
 def main(args=None):
     rclpy.init(args=args)
@@ -240,29 +255,7 @@ def main(args=None):
     time.sleep(2.0)  # Wait for subscriptions to be established
 
     try:
-        node.get_logger().info("Starting robot sequence...")
-        
-        if node.undock():
-            # Test movement
-            node.get_logger().info("Testing movement...")
-            test_twist = Twist()
-            test_twist.linear.x = 0.2
-            for i in range(5):
-                node.cmd_vel_publisher.publish(test_twist)
-                time.sleep(0.1)
-            test_twist.linear.x = 0.0
-            node.cmd_vel_publisher.publish(test_twist)
-            
-            # Move until bump with shorter timeout for testing
-            node.get_logger().info("Moving until bump...")
-            node.move_until_bump(speed=0.2, timeout=15.0)
-            
-            # Complete the sequence
-            node.rotate(math.pi)
-            node.move_forward(1.0)
-            node.dock()
-        else:
-            node.get_logger().error("Failed to undock, aborting sequence")
+        node.discover_room(duration=30.0)
     except Exception as e:
         node.get_logger().error(f"An error occurred: {e}")
         import traceback
