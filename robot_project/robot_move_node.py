@@ -138,13 +138,15 @@ class Create3Controller(Node):
         rclpy.spin_until_future_complete(self, result_future)
 
     def move_forward(self, distance, speed=0.2):
-        self.get_logger().info(f"Moving forward {distance} meters...")
+        """Move forward (or backward if distance<0) by distance (meters)."""
+        sign = 1.0 if distance >= 0 else -1.0
         twist = Twist()
-        twist.linear.x = speed
-        duration = distance / speed
-        start_time = self.get_clock().now().seconds_nanoseconds()[0]
-        while self.get_clock().now().seconds_nanoseconds()[0] - start_time < duration:
+        twist.linear.x = sign * abs(speed)
+        duration = abs(distance) / abs(speed)
+        start = self.get_clock().now().nanoseconds / 1e9
+        while self.get_clock().now().nanoseconds / 1e9 - start < duration:
             self.cmd_vel_publisher.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0)   # allow callbacks
             time.sleep(0.1)
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
@@ -232,12 +234,10 @@ class Create3Controller(Node):
         self.get_logger().info("Time up, returning to dock")
         # undo path in reverse
         for act in reversed(self.path):
-            if act['type']=='rotate':
+            if act['type'] == 'rotate':
                 self.rotate(-act['angle'])
-            else:  # move
-                self.rotate(math.pi)
-                self.move_forward(act['distance'])
-                self.rotate(math.pi)
+            else:  # move: go backward along recorded segment
+                self.move_forward(-act['distance'], speed=speed)
         self.dock()
         time.sleep(1.0)
         self.undock()
@@ -258,7 +258,7 @@ def main(args=None):
     time.sleep(2.0)  # Wait for subscriptions to be established
 
     try:
-        node.discover_room(duration=15.0)
+        node.discover_room(duration=10.0)
     except Exception as e:
         node.get_logger().error(f"An error occurred: {e}")
         import traceback
