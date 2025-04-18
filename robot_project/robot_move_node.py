@@ -12,6 +12,7 @@ import time
 import math
 import threading
 from nav_msgs.msg import Odometry
+from irobot_create_msgs.action import RotateAngle
 
 
 class Create3Controller(Node):
@@ -41,6 +42,13 @@ class Create3Controller(Node):
             callback_group=self.action_callback_group
         )
         
+        self.rotate_client = ActionClient(
+            self,
+            RotateAngle,
+            self.topic_prefix+"/rotate_angle",
+            callback_group=self.action_callback_group
+        )
+
         hazard_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
@@ -181,20 +189,32 @@ class Create3Controller(Node):
         # shortest angular difference
         a = (target - current + math.pi) % (2*math.pi) - math.pi
         return a
+    
+    def rotate(self, angle, angular_speed=0.5):   
+        if not self.rotate_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("RotateAngle action server not available!")
+            return
 
+        goal_msg = RotateAngle.Goal()
+        goal_msg.angle = angle
+        future = self.rotate_client.send_goal_async(goal_msg)
+        rclpy.spin_until_future_complete(self, future)
+        time.sleep(1.0)
+
+'''
     def rotate(self, angle, angular_speed=0.5):
-        self.get_logger().info(f"Rotating {angle} radians (feedback)...")
+        #self.get_logger().info(f"Rotating {angle} radians (feedback)...")
         # accumulate actual yaw change
-        prev_yaw = self.current_yaw
-        turned = 0.0
-        twist = Twist()
-        twist.angular.z = angular_speed if angle > 0 else -angular_speed
+        #prev_yaw = self.current_yaw
+        #turned = 0.0
+        #twist = Twist()
+        #twist.angular.z = angular_speed if angle > 0 else -angular_speed
 
-        while abs(turned) < abs(angle):
-            self.cmd_vel_publisher.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0)
-            # compute incremental yaw (handles wrapping)
-            delta = self._angle_diff(self.current_yaw, prev_yaw)
+        #while abs(turned) < abs(angle):
+        #    self.cmd_vel_publisher.publish(twist)
+        #    rclpy.spin_once(self, timeout_sec=0)
+        #    # compute incremental yaw (handles wrapping)
+        ###    delta = self._angle_diff(self.current_yaw, prev_yaw)
             turned += delta
             prev_yaw = self.current_yaw
             time.sleep(0.02)
@@ -202,8 +222,8 @@ class Create3Controller(Node):
         # stop rotation
         twist.angular.z = 0.0
         self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info("Rotation complete")
-
+        self.get_logger().info("Rotation complete")'''
+        
 
 def main(args=None):
     rclpy.init(args=args)
