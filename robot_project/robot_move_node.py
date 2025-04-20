@@ -19,78 +19,92 @@ class Create3Controller(Node):
     def __init__(self):
         super().__init__("create3_controller")
 
-        self.declare_parameter("topicPrefix","")
+        self.declare_parameter("topicPrefix", "")
         self.topic_prefix = self.get_parameter("topicPrefix").value
-        
+
         # Create callback groups
         self.hazard_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = MutuallyExclusiveCallbackGroup()
-        
+
         self.cmd_vel_publisher = self.create_publisher(
-            Twist, self.topic_prefix+"/cmd_vel", QoSProfile(depth=10)
+            Twist, self.topic_prefix + "/cmd_vel", QoSProfile(depth=10)
         )
         self.undock_client = ActionClient(
-            self, 
-            Undock, 
-            self.topic_prefix+"/undock", 
-            callback_group=self.action_callback_group
+            self,
+            Undock,
+            self.topic_prefix + "/undock",
+            callback_group=self.action_callback_group,
         )
         self.dock_client = ActionClient(
-            self, 
-            Dock, 
-            self.topic_prefix+"/dock", 
-            callback_group=self.action_callback_group
+            self,
+            Dock,
+            self.topic_prefix + "/dock",
+            callback_group=self.action_callback_group,
         )
-        
+
         self.rotate_client = ActionClient(
             self,
             RotateAngle,
-            self.topic_prefix+"/rotate_angle",
-            callback_group=self.action_callback_group
+            self.topic_prefix + "/rotate_angle",
+            callback_group=self.action_callback_group,
         )
 
         hazard_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=10,
         )
-        
+
         self.hazard_subscription = self.create_subscription(
             HazardDetectionVector,
-            self.topic_prefix+'/hazard_detection',
+            self.topic_prefix + "/hazard_detection",
             self.hazard_callback,
             hazard_qos,
-            callback_group=self.hazard_callback_group
+            callback_group=self.hazard_callback_group,
         )
         self.current_yaw = 0.0
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.last_bump_side = "front"
         self.odom_subscription = self.create_subscription(
             Odometry,
-            self.topic_prefix + '/odom',
+            self.topic_prefix + "/odom",
             self.odom_callback,
             QoSProfile(depth=10),
-            callback_group=self.hazard_callback_group
+            callback_group=self.hazard_callback_group,
         )
         self.bump_detected = False
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
     def hazard_callback(self, msg):
-        self.get_logger().info(f"Received hazard detection with {len(msg.detections)} detections")
         for detection in msg.detections:
             if detection.type == HazardDetection.BUMP:
+                # detect which side bumped
+                fid = detection.header.frame_id.lower()
+                if "left" in fid:
+                    self.last_bump_side = "left"
+                elif "right" in fid:
+                    self.last_bump_side = "right"
+                else:
+                    self.last_bump_side = "front"
                 self.bump_detected = True
                 # Check if the bump is in the front center
                 if "front_center" in detection.header.frame_id:
                     self.front_center_bump = True
-                    self.get_logger().info(f"Front center bump detected! Frame: {detection.header.frame_id}")
+                    self.get_logger().info(
+                        f"Front center bump detected! Frame: {detection.header.frame_id}"
+                    )
                 else:
-                    self.get_logger().info(f"Bump detected in: {detection.header.frame_id}")
-    
+                    self.get_logger().info(
+                        f"Bump detected in: {detection.header.frame_id}"
+                    )
+
     def undock(self):
         self.get_logger().info("Undocking...")
         if not self.undock_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error("Undock action server not available!")
-            return False  # Return False to indicate failure
+            self.get_logger().error("undock error")
+            return False
 
         goal_msg = Undock.Goal()
         future = self.undock_client.send_goal_async(goal_msg)
@@ -98,27 +112,27 @@ class Create3Controller(Node):
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Undock goal rejected!")
+            self.get_logger().error("not undocked")
             return False
 
-        self.get_logger().info("Undock goal accepted.")
+        self.get_logger().info("going to undock")
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
-        
+
         # Check if undocking was successful
         if result_future.result():
-            self.get_logger().info("Successfully undocked")
+            self.get_logger().info("undocked with success")
             # Wait a moment after undocking
             time.sleep(2.0)
             return True
         else:
-            self.get_logger().error("Failed to undock")
+            self.get_logger().error("not undocked")
             return False
 
     def dock(self):
         self.get_logger().info("Docking...")
         if not self.dock_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error("Dock action server not available!")
+            self.get_logger().error("dock error")
             return
 
         goal_msg = Dock.Goal()
@@ -127,70 +141,80 @@ class Create3Controller(Node):
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Dock goal rejected!")
+            self.get_logger().error("not docked")
             return
 
-        self.get_logger().info("Dock goal accepted.")
+        self.get_logger().info("going to dock")
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
 
     def move_forward(self, distance, speed=0.2):
-        self.get_logger().info(f"Moving forward {distance} meters...")
+        sign = 1.0 if distance >= 0 else -1.0
         twist = Twist()
-        twist.linear.x = speed
-        duration = distance / speed
-        start_time = self.get_clock().now().seconds_nanoseconds()[0]
-        while self.get_clock().now().seconds_nanoseconds()[0] - start_time < duration:
+        twist.linear.x = sign * abs(speed)
+        duration = abs(distance) / abs(speed)
+        start = self.get_clock().now().nanoseconds / 1e9
+        while self.get_clock().now().nanoseconds / 1e9 - start < duration:
             self.cmd_vel_publisher.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0)
             time.sleep(0.1)
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
 
-    def move_until_bump(self, speed=0.2, timeout=30.0):
-        self.get_logger().info("Moving forward until any bump detected...")
+    def move_until_bump(self, speed=0.2, timeout=30.0, backup_dist=0.1):
+        # record start pose
+        x_start, y_start = self.current_x, self.current_y
         self.bump_detected = False
 
         twist = Twist()
         twist.linear.x = speed
-
         start = self.get_clock().now().nanoseconds / 1e9
-        last_log = start
 
+        # move forward until bump or timeout
         while not self.bump_detected:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - start > timeout:
-                self.get_logger().info("Timeout reached without bump")
                 break
-
             self.cmd_vel_publisher.publish(twist)
-            # let any incoming hazard_callback run
             rclpy.spin_once(self, timeout_sec=0)
-
-            # periodic status
-            if now - last_log > 2.0:
-                self.get_logger().info(f"Still moving… bump_detected={self.bump_detected}")
-                last_log = now
-
             time.sleep(0.05)
 
-        # stop motion
+        # stop forward motion
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info("Stopped after bump or timeout")
 
+        # compute forward distance travelled
+        fwd_dist = math.hypot(self.current_x - x_start, self.current_y - y_start)
+
+        # back up a bit to clear obstacle
+        if self.bump_detected:
+            twist.linear.x = -speed
+            dur = backup_dist / speed
+            t0 = self.get_clock().now().nanoseconds / 1e9
+            while self.get_clock().now().nanoseconds / 1e9 - t0 < dur:
+                self.cmd_vel_publisher.publish(twist)
+                rclpy.spin_once(self, timeout_sec=0)
+                time.sleep(0.05)
+            twist.linear.x = 0.0
+            self.cmd_vel_publisher.publish(twist)
+
+        return fwd_dist
+
+    # rotate to a given angle
     def odom_callback(self, msg):
-        # extract yaw from quaternion
         q = msg.pose.pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny, cosy)
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
 
+    # get the difference between two angles
     def _angle_diff(self, target, current):
-        # shortest angular difference
-        a = (target - current + math.pi) % (2*math.pi) - math.pi
+        a = (target - current + math.pi) % (2 * math.pi) - math.pi
         return a
-    
-    def rotate(self, angle, angular_speed=0.5):   
+
+    def rotate(self, angle):
         if not self.rotate_client.wait_for_server(timeout_sec=10.0):
             self.get_logger().error("RotateAngle action server not available!")
             return
@@ -201,80 +225,88 @@ class Create3Controller(Node):
         rclpy.spin_until_future_complete(self, future)
         time.sleep(1.0)
 
-'''
-    def rotate(self, angle, angular_speed=0.5):
-        #self.get_logger().info(f"Rotating {angle} radians (feedback)...")
-        # accumulate actual yaw change
-        #prev_yaw = self.current_yaw
-        #turned = 0.0
-        #twist = Twist()
-        #twist.angular.z = angular_speed if angle > 0 else -angular_speed
+    def return_to_dock(self, speed=0.2, backup_dist=0.1):
+        self.get_logger().info("Returning to dock")
+        while True:
+            dx = -self.current_x
+            dy = -self.current_y
+            dist = math.hypot(dx, dy)
+            if dist <= 1:
+                # face dock directly
+                target_yaw = math.atan2(dy, dx)
+                self.rotate(self._angle_diff(target_yaw, self.current_yaw))
+                # final move to exactly 1 m away
+                delta = dist - 1
+                if abs(delta) > 0.01:
+                    self.move_forward(delta)
+                break
 
-        #while abs(turned) < abs(angle):
-        #    self.cmd_vel_publisher.publish(twist)
-        #    rclpy.spin_once(self, timeout_sec=0)
-        #    # compute incremental yaw (handles wrapping)
-        ###    delta = self._angle_diff(self.current_yaw, prev_yaw)
-            turned += delta
-            prev_yaw = self.current_yaw
-            time.sleep(0.02)
+            # face dock
+            target_yaw = math.atan2(dy, dx)
+            self.rotate(self._angle_diff(target_yaw, self.current_yaw))
 
-        # stop rotation
-        twist.angular.z = 0.0
-        self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info("Rotation complete")'''
-        
+            # move toward dock while avoiding obstacles
+            self.move_until_bump(
+                speed=speed, timeout=dist / speed + 1, backup_dist=backup_dist
+            )
+            if self.bump_detected:
+                # pick turn direction
+                if self.last_bump_side == "left":
+                    turn = -math.pi / 2
+                else:
+                    turn = math.pi / 2
+                self.rotate(turn)
+
+        self.get_logger().info("ready to docking")
+        self.dock()
+
+    def discover_room(self, duration, speed=0.2):
+        if not self.undock():
+            self.get_logger().error("Undock failed")
+            return
+        self.get_logger().info(f"discovery is {duration}s")
+        start_t = self.get_clock().now().nanoseconds / 1e9
+        while self.get_clock().now().nanoseconds / 1e9 - start_t < duration:
+            self.move_until_bump(speed=speed, timeout=duration, backup_dist=0.1)
+            # turn based on last bump side
+            if self.last_bump_side == "left":
+                self.rotate(-math.pi / 2)
+            else:
+                # front or right turns left
+                self.rotate(math.pi / 2)
+        # time up: navigate back to dock
+        self.return_to_dock(speed=speed, backup_dist=0.1)
+        self.get_logger().info("Discovery complete")
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = Create3Controller()
-    
-    # Set up the executor and spin in a separate thread
-    executor = MultiThreadedExecutor(num_threads=4)  # Use more threads
+
+    # we had to use MultiThreading, the project was very choppy and laggy without the threads
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
     executor_thread.start()
-    
-    # Test if bumper callback is working properly
-    node.get_logger().info("Waiting to verify hazard detection subscription...")
-    time.sleep(2.0)  # Wait for subscriptions to be established
+
+    time.sleep(1.0)  # wait for subscriptions to be established
 
     try:
-        node.get_logger().info("Starting robot sequence...")
-        
-        if node.undock():
-            # Test movement
-            node.get_logger().info("Testing movement...")
-            test_twist = Twist()
-            test_twist.linear.x = 0.2
-            for i in range(5):
-                node.cmd_vel_publisher.publish(test_twist)
-                time.sleep(0.1)
-            test_twist.linear.x = 0.0
-            node.cmd_vel_publisher.publish(test_twist)
-            
-            # Move until bump with shorter timeout for testing
-            node.get_logger().info("Moving until bump...")
-            node.move_until_bump(speed=0.2, timeout=15.0)
-            
-            # Complete the sequence
-            node.rotate(math.pi)
-            node.move_forward(1.0)
-            node.dock()
-        else:
-            node.get_logger().error("Failed to undock, aborting sequence")
+        node.discover_room(duration=10.0)
     except Exception as e:
         node.get_logger().error(f"An error occurred: {e}")
         import traceback
+
         node.get_logger().error(traceback.format_exc())
     finally:
         # Stop the robot
         stop_cmd = Twist()
         node.cmd_vel_publisher.publish(stop_cmd)
-        
-        time.sleep(1.0)  # Give time for final commands to be processed
+
+        time.sleep(1.0)  # wait time for final commands to be processed
         rclpy.shutdown()
         executor_thread.join(timeout=3.0)  # Add timeout to prevent hanging
-        
+
+
 if __name__ == "__main__":
     main()
