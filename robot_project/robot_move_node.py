@@ -15,6 +15,7 @@ from nav_msgs.msg import Odometry
 from irobot_create_msgs.action import RotateAngle
 from group1_interfaces.msg import Interrupt
 from rclpy.duration import Duration
+import sys
 
 class Create3Controller(Node):
     def __init__(self):
@@ -102,7 +103,7 @@ class Create3Controller(Node):
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
     def dock_status_callback(self,msg: DockStatus):
-        if self.state != self.MANUAL_CONTROL and self.state != self.DOCKED:
+        if self.state != self.MANUAL_CONTROL and self.state != self.DOCKED and self.state == self.RETURN:
             if msg.dock_visible:
                 self.state = self.SHOULD_DOCK
 
@@ -121,6 +122,8 @@ class Create3Controller(Node):
 
     def interrupt_callback(self, msg):
         self.state = self.MANUAL_CONTROL
+        self.cmd_vel_publisher.publish(Twist())
+        time.sleep(0.1)
     
     def undock(self):
         self.get_logger().info("Undocking...")
@@ -240,16 +243,36 @@ class Create3Controller(Node):
         goal_msg.angle = angle
         future = self.rotate_client.send_goal_async(goal_msg)
         rclpy.spin_until_future_complete(self, future)
+    
+    def compute_input(self,input):
+        message = Twist()
+        if input == 'a':
+            message.angular.z = 1.0
+        elif input == 'd':
+            message.angular.z = -1.0
+        elif input == 'w':
+            message.linear.x = 3.0
+        elif input == 's':
+            message.linear.x = -1.0
+        else : return
+        self.cmd_vel_publisher.publish(message)
 
     def control_loop(self):
-        if self.state == self.MANUAL_CONTROL: return
+        if self.state == self.MANUAL_CONTROL: 
+            input = sys.stdin.read(1)
+            self.compute_input(input)
+            return
         if self.get_clock().now()-self.start_time >= Duration(seconds=self.timeout) and not self.timeout_happened:
             self.rotate(math.pi)
-            self.state == self.RETURN
+            self.state = self.RETURN
             self.timeout_happened = True
             return
         if self.state == self.RETURN:
-            self.move_forward(1.0)
+            #self.move_forward(1.0)
+            message = Twist()
+            message.linear.x = 1.0
+            self.cmd_vel_publisher.publish(message)
+            time.sleep(0.5)
             return
         if self.state == self.AVOID_OBSTACLE:
             self.rotate(math.pi)
@@ -261,7 +284,11 @@ class Create3Controller(Node):
             self.undocked = True
             return
         if self.state == self.EXPLORE:
-            self.move_forward(1.0)
+            #self.move_forward(1.0)
+            message = Twist()
+            message.linear.x = 1.0
+            self.cmd_vel_publisher.publish(message)
+            time.sleep(0.5)
             return
         if self.state == self.SHOULD_DOCK:
             self.dock()
