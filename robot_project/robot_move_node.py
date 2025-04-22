@@ -5,7 +5,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from geometry_msgs.msg import Twist
 from irobot_create_msgs.action import Dock, Undock
-from irobot_create_msgs.msg import HazardDetectionVector, HazardDetection
+from irobot_create_msgs.msg import HazardDetectionVector, HazardDetection, DockStatus
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 import time
@@ -13,7 +13,9 @@ import math
 import threading
 from nav_msgs.msg import Odometry
 from irobot_create_msgs.action import RotateAngle
-
+from group1_interfaces.msg import Interrupt
+from rclpy.duration import Duration
+import sys
 
 class Create3Controller(Node):
     def __init__(self):
@@ -22,6 +24,15 @@ class Create3Controller(Node):
         self.declare_parameter("topicPrefix", "")
         self.topic_prefix = self.get_parameter("topicPrefix").value
 
+        self.EXPLORE = 0
+        self.AVOID_OBSTACLE = 1
+        self.MANUAL_CONTROL = 2
+        self.SHOULD_DOCK = 3
+        self.DOCKED = 4
+        self.RETURN = 5
+        self.state = self.DOCKED
+        self.prev_state = self.DOCKED
+        
         # Create callback groups
         self.hazard_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = MutuallyExclusiveCallbackGroup()
@@ -72,14 +83,39 @@ class Create3Controller(Node):
             self.topic_prefix + "/odom",
             self.odom_callback,
             QoSProfile(depth=10),
-            callback_group=self.hazard_callback_group,
+            callback_group=self.hazard_callback_group
         )
-        self.bump_detected = False
+
+        self.interrupt_subscription = self.create_subscription(
+           Interrupt,
+            "/interrupt_topic",
+            self.interrupt_callback,
+            10
+        )
+
+        self.dock_status_subscription = self.create_subscription(
+            DockStatus,
+            self.topic_prefix+'/dock_status',
+            self.dock_status_callback,
+            10  
+        )
+        self.timeout = 30
+        self.timeout_happened = False
+        self.undocked = False
+        self.start_time = self.get_clock().now()
         self.get_logger().info("Node initialized and subscribed to hazard detection")
 
+    def dock_status_callback(self,msg: DockStatus):
+        if self.state != self.MANUAL_CONTROL and self.state != self.DOCKED and self.state==self.RETURN:
+            if msg.dock_visible:
+                self.state = self.SHOULD_DOCK
+
     def hazard_callback(self, msg):
+        if self.state == self.MANUAL_CONTROL or self.state == self.DOCKED: return
         for detection in msg.detections:
             if detection.type == HazardDetection.BUMP:
+                self.prev_state = self.state
+                self.state = self.AVOID_OBSTACLE
                 # detect which side bumped
                 fid = detection.header.frame_id.lower()
                 if "left" in fid:
@@ -99,6 +135,11 @@ class Create3Controller(Node):
                     self.get_logger().info(
                         f"Bump detected in: {detection.header.frame_id}"
                     )
+
+    def interrupt_callback(self, msg):
+        self.state = self.MANUAL_CONTROL
+        self.cmd_vel_publisher.publish(Twist())
+        time.sleep(0.1)
 
     def undock(self):
         self.get_logger().info("Undocking...")
@@ -149,6 +190,8 @@ class Create3Controller(Node):
         rclpy.spin_until_future_complete(self, result_future)
 
     def move_forward(self, distance, speed=0.2):
+        if self.state == self.MANUAL_CONTROL:
+            return
         sign = 1.0 if distance >= 0 else -1.0
         twist = Twist()
         twist.linear.x = sign * abs(speed)
@@ -161,8 +204,8 @@ class Create3Controller(Node):
         twist.linear.x = 0.0
         self.cmd_vel_publisher.publish(twist)
 
-    def move_until_bump(self, speed=0.2, timeout=30.0, backup_dist=0.1):
-        # record start pose
+    def move_until_bump(self, speed=0.2, timeout=30.0,backup_dist = 0.1):
+        if self.state == self.MANUAL_CONTROL: return
         x_start, y_start = self.current_x, self.current_y
         self.bump_detected = False
 
@@ -215,6 +258,7 @@ class Create3Controller(Node):
         return a
 
     def rotate(self, angle):
+        if self.state == self.MANUAL_CONTROL: return
         if not self.rotate_client.wait_for_server(timeout_sec=10.0):
             self.get_logger().error("RotateAngle action server not available!")
             return
@@ -278,6 +322,85 @@ class Create3Controller(Node):
         self.return_to_dock(speed=speed, backup_dist=0.1)
         self.get_logger().info("Discovery complete")
 
+    def compute_input(self,input):
+        message = Twist()
+        if input == 'a':
+            message.angular.z = 1.0
+        elif input == 'd':
+            message.angular.z = -1.0
+        elif input == 'w':
+            message.linear.x = 3.0
+        elif input == 's':
+            message.linear.x = -1.0
+        else : return
+        self.cmd_vel_publisher.publish(message)
+
+
+    def control_loop(self):
+        print(self.state)
+        if self.state == self.MANUAL_CONTROL: 
+            input = sys.stdin.read(1)
+            self.compute_input(input)
+            return
+        if self.get_clock().now()-self.start_time >= Duration(seconds=self.timeout) and not self.timeout_happened:
+            self.state = self.RETURN
+            self.timeout_happened = True
+            return
+        if self.state == self.RETURN:
+            dx = -self.current_x
+            dy = -self.current_y
+            dist = math.hypot(dx, dy)
+            # face dock
+            target_yaw = math.atan2(dy, dx)
+            if self._angle_diff(target_yaw, self.current_yaw) > 0.01:
+                self.rotate(self._angle_diff(target_yaw, self.current_yaw))
+            #if dist <= 1:
+                # final move to exactly 1 m away
+            #    delta = dist - 1
+            #    if abs(delta) > 0.01:
+            #        self.move_forward(delta)
+            #    return
+
+            # move toward dock while avoiding obstacles
+            twist = Twist()
+            twist.linear.x = 1.0
+            self.cmd_vel_publisher.publish(twist)
+            time.sleep(0.1)
+            return
+        if self.state == self.AVOID_OBSTACLE:
+            twist = Twist()
+            twist.linear.x = 0.0
+            self.cmd_vel_publisher.publish(twist)
+            twist.linear.x = -1.0
+            dur = 0.8
+            t0 = self.get_clock().now().nanoseconds / 1e9
+            while self.get_clock().now().nanoseconds / 1e9 - t0 < dur:
+                self.cmd_vel_publisher.publish(twist)
+                time.sleep(0.1)
+            #twist.linear.x = 0.0
+            #self.cmd_vel_publisher.publish(twist)
+            time.sleep(0.4)
+            if self.last_bump_side == "left":
+                self.rotate(-math.pi / 2)
+            else:
+                # front or right turns left
+                self.rotate(math.pi / 2)
+            self.state = self.prev_state
+            return
+        if self.state == self.DOCKED and not self.undocked:
+            self.undock()
+            self.state = self.EXPLORE
+            self.undocked = True
+            return
+        if self.state == self.EXPLORE:
+            message = Twist()
+            message.linear.x = 1.0
+            self.cmd_vel_publisher.publish(message)
+            time.sleep(0.5)
+            return
+        if self.state == self.SHOULD_DOCK:
+            self.dock()
+            self.state = self.DOCKED
 
 def main(args=None):
     rclpy.init(args=args)
@@ -306,7 +429,14 @@ def main(args=None):
         time.sleep(1.0)  # wait time for final commands to be processed
         rclpy.shutdown()
         executor_thread.join(timeout=3.0)  # Add timeout to prevent hanging
-
-
+    
+def main(args=None):
+    rclpy.init(args=args)
+    node = Create3Controller()
+    node.create_timer(0.05,node.control_loop)
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+        
 if __name__ == "__main__":
     main()
