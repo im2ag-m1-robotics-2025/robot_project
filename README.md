@@ -10,7 +10,7 @@ The following goals were realized
 5. The robot avoids obstacles in its way
 
 # Project setup
-First clone the code from this repository into a ROS2 Workspace.
+First clone the code from this repository into a ROS2 Workspace. The relevant branch is refactoring.
 Then, clone the repository group1_interfaces (https://github.com/im2ag-m1-robotics-2025/group1_interfaces.git).
 
 Run
